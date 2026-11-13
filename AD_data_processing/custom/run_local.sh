@@ -28,6 +28,14 @@ export REFERENCE_BRAIN="${REFERENCE_BRAIN:-$MOUNT/OASIS_AIBL_rerun/ref/MNI152_T1
 # '' = FreeSurfer's TensorFlow uses the local CUDA install as is (the server needs a pip CUDA env)
 export TFCUDA_SITE_PACKAGES="${TFCUDA_SITE_PACKAGES-}"
 
+# OASIS-3 split with the server (server from the back, this machine from the front): CLAIM_DIR = the server's
+# <cohort>_processed/claims folder mounted read-write; scans claimed by the server are skipped
+CLAIM_ARGS=()
+if [ -n "${CLAIM_DIR:-}" ]; then
+    [ -d "$CLAIM_DIR" ] && [ -w "$CLAIM_DIR" ] || { echo "CLAIM_DIR $CLAIM_DIR is not a writable folder" >&2; exit 1; }
+    CLAIM_ARGS=(--claim-dir "$CLAIM_DIR" --claim-as local)
+fi
+
 COHORT="$COHORT" \
 AFFINE=register \
 MANIFEST="$REMAINING" \
@@ -40,4 +48,4 @@ CPU_WORKERS="${CPU_WORKERS:-8}" \
 STRIP_WORKERS="${STRIP_WORKERS:-3}" \
 STRIP_THREADS="${STRIP_THREADS:-4}" \
 STOP_NEW_AT="" \
-    bash custom/run_preprocess_cohort.sh --min-age-min 0 "$@"
+    bash custom/run_preprocess_cohort.sh --min-age-min 0 ${CLAIM_ARGS[@]+"${CLAIM_ARGS[@]}"} "$@"

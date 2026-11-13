@@ -35,6 +35,12 @@ SynthSeg queue is flushed, then the run exits. At the end, the manifest rows of 
 complete (deferred, failed, still being copied) are written to <out_dir>/logs/remaining_<cohort>_<time>.csv,
 a manifest the other machine can run as is.
 
+Two machines on one manifest (--claim-dir, --claim-as, --reverse): each machine writes to its own --out-dir
+and, right before starting a scan, creates <claim-dir>/<subject>__<image> holding its --claim-as label
+(exclusive create). A scan claimed by the other machine is skipped, so one machine can work from the front
+and the other from the back (--reverse) until they meet. Scans already complete in --out-dir are claimed at
+start-up. A claim with the own label is honoured on a restart (resume).
+
 Run --list-only first. Without the --col-* options it prints the manifest columns.
 
 Usage (see run_preprocess_cohort.sh, which sets the paths and the CPU settings):
@@ -53,6 +59,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -245,7 +252,45 @@ class StopRequest:
             self.n_deferred += 1
 
 
-def process(run: CohortRun, batcher: P.SegBatcher, gate: P.CpuGate, job: dict, stop: StopRequest) -> None:
+class Claims:
+    """Per-scan claim files shared by two machines (see the module doc). Atomicity only avoids duplicate work:
+    the machines write to different --out-dir, so a double claim never corrupts an output."""
+
+    def __init__(self, claim_dir: Path, me: str):
+        self.dir, self.me = claim_dir, me
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.n_other = 0
+
+    def path(self, job: dict) -> Path:
+        return self.dir / f"{job['subject_id']}__{job['image_id']}"
+
+    def owner(self, job: dict) -> str | None:
+        try:
+            text = self.path(job).read_text().split()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return ""
+        return text[0] if text else ""          # "" = being written by its creator right now
+
+    def take(self, job: dict) -> bool:
+        p = self.path(job)
+        try:
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o664)
+        except FileExistsError:
+            if self.owner(job) == self.me:
+                return True
+            with self.lock:
+                self.n_other += 1
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(f"{self.me} {socket.gethostname()} {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        return True
+
+
+def process(run: CohortRun, batcher: P.SegBatcher, gate: P.CpuGate, job: dict, stop: StopRequest,
+            claims: Claims | None = None) -> None:
     if stop():
         stop.defer()
         return
@@ -255,6 +300,8 @@ def process(run: CohortRun, batcher: P.SegBatcher, gate: P.CpuGate, job: dict, s
             if stop():                       # waited at the gate past the stop time: nothing started yet
                 stop.defer()
                 return
+            if claims is not None and not claims.take(job):
+                return                       # the other machine has it
             if job["kind"] == "nifti":
                 stage_nifti(job["dicom_dir"], job["paths"])
             cpu_stage(run, job)
@@ -329,6 +376,9 @@ def main():
     ap.add_argument("--list-only", action="store_true", help="Check the manifest and the inputs, no processing.")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--log-file", default=None, help="default: <out_dir>/preprocess_log.jsonl")
+    ap.add_argument("--reverse", action="store_true", help="Process the manifest from the last row backwards.")
+    ap.add_argument("--claim-dir", default="", help="Shared folder of per-scan claims for two machines on one manifest.")
+    ap.add_argument("--claim-as", default="", help="This machine's label in --claim-dir, e.g. server or local.")
     ap.add_argument("--stop-new-at", default="", metavar="YYYY-MM-DDTHH:MM",
                     help="Start no new scan after this local time (also: create <out_dir>/logs/STOP); scans in "
                          "progress finish, then the unfinished manifest rows go to <out_dir>/logs/remaining_*.csv.")
@@ -340,6 +390,8 @@ def main():
         ap.error(f"--keep: unknown {sorted(keep - set(P.INTERMEDIATES))}, choose from {P.INTERMEDIATES}")
     if args.reg_seed == 0:
         ap.error("--reg-seed must be nonzero (antsRegistration treats 0 as unseeded)")
+    if bool(args.claim_dir) != bool(args.claim_as) or (args.claim_as and not args.claim_as.isidentifier()):
+        ap.error("--claim-dir and --claim-as go together; --claim-as is one word, e.g. server or local")
     try:
         stop_at = datetime.fromisoformat(args.stop_new_at) if args.stop_new_at else None
     except ValueError:
@@ -505,6 +557,22 @@ def main():
                 n_done, len(todo), len(pending), args.min_age_min, sum(id(j) not in pend for j, _ in stale))
     if pending:
         logger.info("  e.g. %s", [str(j["dicom_dir"]) for j in pending[:3]])
+    if args.reverse:
+        todo.reverse()
+    claims = None
+    if args.claim_dir:
+        claims = Claims(Path(args.claim_dir), args.claim_as)
+        mine = [j for j in jobs if P.is_complete(j["paths"])]
+        for j in mine:
+            claims.take(j)
+        n_other0 = claims.n_other
+        todo = [j for j in todo if claims.owner(j) in (None, args.claim_as)]
+        logger.info("claims %s as %r: %d complete here claimed (%d of them also claimed by the other machine), "
+                    "%d to process not claimed by the other machine%s", claims.dir, args.claim_as, len(mine),
+                    n_other0, len(todo), ", in reverse order" if args.reverse else "")
+        claims.n_other = 0
+    elif args.reverse:
+        logger.info("processing in reverse manifest order")
     if args.limit:
         todo = todo[: args.limit]
 
@@ -517,15 +585,17 @@ def main():
         batcher = P.SegBatcher(run, gpu_specs, args.slots_per_gpu, seg_env)
         gate = P.CpuGate(args, out_dir / "logs" / "cpu_workers")
         with ThreadPoolExecutor(max_workers=args.cpu_workers) as executor:
-            for future in [executor.submit(process, run, batcher, gate, j, stop) for j in todo]:
+            for future in [executor.submit(process, run, batcher, gate, j, stop, claims) for j in todo]:
                 future.result()
         logger.info("CPU stage finished, waiting for the remaining SynthSeg batches")
         batcher.close_and_join()
-    logger.info("done: %d ok, %d failed, %d not started (stop requested). log: %s",
-                run.n_ok, run.n_done - run.n_ok, stop.n_deferred, log_path)
+    logger.info("done: %d ok, %d failed, %d not started (stop requested)%s. log: %s",
+                run.n_ok, run.n_done - run.n_ok, stop.n_deferred,
+                f", {claims.n_other} skipped (claimed by the other machine)" if claims else "", log_path)
 
     # manifest rows of everything not complete now: input for a run elsewhere (same columns as --manifest)
-    remaining = [j for j in jobs if not P.is_complete(j["paths"])]
+    remaining = [j for j in jobs if not P.is_complete(j["paths"])
+                 and (claims is None or claims.owner(j) in (None, args.claim_as))]
     if remaining:
         rem_path = out_dir / "logs" / f"remaining_{args.cohort}_{time.strftime('%Y%m%d_%H%M')}.csv"
         with rem_path.open("w", newline="") as f:
